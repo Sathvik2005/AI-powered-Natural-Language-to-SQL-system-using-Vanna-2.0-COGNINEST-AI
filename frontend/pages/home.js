@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import axios from 'axios';
 import Head from 'next/head';
 
-const API_URL = 'http://localhost:8001';
+const API_URL = 'http://localhost:8000';
 
 export default function Home() {
   const [question, setQuestion] = useState('');

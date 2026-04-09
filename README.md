@@ -106,6 +106,14 @@ You need a Groq API key (free, no credit card required):
 Follow these exact commands:
 
 ```bash
+# Quick Start - All in one command
+pip install -r requirements.txt && python setup_database.py && python seed_memory.py && uvicorn main:app --port 8000
+```
+
+The system will be available at http://localhost:8000
+
+**Or run separately:**
+```bash
 # 1. Install Python dependencies
 pip install -r requirements.txt
 
@@ -116,10 +124,8 @@ python setup_database.py
 python seed_memory.py
 
 # 4. Start the API server
-uvicorn main:app --port 8001
+uvicorn main:app --port 8000
 ```
-
-The system will be available at http://localhost:8001
 
 ### Detailed Setup
 
@@ -199,14 +205,14 @@ This pre-loads the agent with 15+ example question-SQL pairs covering:
 #### Step 6: Start Backend API
 
 ```bash
-uvicorn main:app --port 8001
+uvicorn main:app --port 8000
 ```
 
-Server will start at http://localhost:8001
+Server will start at http://localhost:8000
 
 Test the health endpoint:
 ```bash
-curl http://localhost:8001/health
+curl http://localhost:8000/health
 ```
 
 Expected response:

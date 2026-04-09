@@ -1,6 +1,12 @@
 """
 FastAPI Backend for NL2SQL - CORRECTED for Vanna 2.0
 Uses proper async API, RequestContext, and error handling
+Features:
+- Chart generation with Plotly
+- Input validation
+- Query caching with TTL
+- Rate limiting
+- Structured logging
 """
 
 import os
@@ -9,23 +15,26 @@ import logging
 import json
 from typing import Optional
 from contextlib import asynccontextmanager
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from vanna_setup import create_vanna_agent
-from utils import SQLValidator, format_response, extract_summary
+from utils import SQLValidator, InputValidator, format_response, extract_summary, query_cache, logger
 from vanna.core.user import RequestContext
 
 # Load environment variables
 load_dotenv()
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Setup rate limiting (10 requests per minute per IP)
+limiter = Limiter(key_func=get_remote_address)
 
 # Global agent instance
 agent = None
@@ -62,20 +71,25 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager to initialize agent on startup"""
     global agent, agent_memory
     
-    print("\n[*] Starting NL2SQL Server...\n")
+    logger.info("=" * 80)
+    logger.info("Starting NL2SQL Server with Advanced Features")
+    logger.info("Features: Caching | Rate Limiting | Validation | Logging | Charts")
+    logger.info("=" * 80)
     
     try:
         # Initialize Vanna Agent (returns tuple: agent, memory)
         agent, agent_memory = create_vanna_agent()
-        print("[+] Agent initialized successfully\n")
+        logger.info("✓ Agent initialized successfully")
     except Exception as e:
-        logger.error(f"[-] Failed to initialize agent: {str(e)}")
-        print(f"[-] Failed to initialize agent: {str(e)}")
+        logger.error(f"✗ Failed to initialize agent: {str(e)}", exc_info=True)
         raise
     
     yield
     
-    print("\n[*] Shutting down NL2SQL Server...\n")
+    logger.info("=" * 80)
+    logger.info("Shutting down NL2SQL Server")
+    logger.info(f"Cache Statistics: {json.dumps(query_cache.stats())}")
+    logger.info("=" * 80)
 
 
 # Create FastAPI app with lifespan
@@ -85,6 +99,13 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan
 )
+
+# Add rate limiting to app
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
+    status_code=429,
+    content={"error": "Rate limit exceeded. Maximum 10 requests per minute."}
+))
 
 # Add CORS middleware for frontend access
 app.add_middleware(
@@ -98,9 +119,11 @@ app.add_middleware(
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with cache statistics"""
     
     import sqlite3
+    
+    logger.debug("Health check requested")
     
     # Check database
     db_connected = False
@@ -110,6 +133,7 @@ async def health_check():
         cursor.execute("SELECT COUNT(*) FROM patients")
         db_connected = True
         conn.close()
+        logger.debug("Database check passed")
     except Exception as e:
         logger.warning(f"Database check failed: {str(e)}")
         db_connected = False
@@ -121,38 +145,62 @@ async def health_check():
     )
 
 
+@app.get("/cache-stats")
+async def cache_statistics():
+    """Get cache statistics"""
+    logger.info("Cache statistics requested")
+    return query_cache.stats()
+
+
 @app.post("/chat")
-async def chat(request: ChatRequest):
+@limiter.limit("10/minute")
+async def chat(request: Request, chat_request: ChatRequest):
     """
     Main chat endpoint for NL2SQL queries.
-    Properly uses Vanna 2.0 async API with RequestContext.
+    Features:
+    - Input validation
+    - Query caching
+    - Rate limiting
+    - Structured logging
+    - Chart generation
     """
     
-    question = request.question.strip()
+    question = chat_request.question.strip()
+    request_id = f"{datetime.now().timestamp()}"
     
-    # Validate input
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    logger.info(f"[{request_id}] New chat request from {request.client.host}")
     
-    if len(question) > 500:
-        raise HTTPException(status_code=400, detail="Question too long (max 500 chars)")
+    # ========== INPUT VALIDATION ==========
+    is_valid, error_msg = InputValidator.validate(question)
+    if not is_valid:
+        logger.warning(f"[{request_id}] Input validation failed: {error_msg}")
+        raise HTTPException(status_code=400, detail=error_msg)
+    
+    logger.info(f"[{request_id}] Input validation passed: Q='{question[:50]}...'")
+    
+    # ========== CHECK CACHE ==========
+    cached_result = query_cache.get(question)
+    if cached_result:
+        logger.info(f"[{request_id}] Returning cached result")
+        return JSONResponse(cached_result)
     
     if not agent:
+        logger.error(f"[{request_id}] Agent not initialized")
         raise HTTPException(status_code=503, detail="Agent not initialized")
     
-    logger.info(f"[*] Received question: {question}")
+    logger.info(f"[{request_id}] Processing new question (cache miss)")
     
     try:
         # ========== CREATE REQUEST CONTEXT ==========
-        # This is REQUIRED for Vanna 2.0 send_message()
         request_context = RequestContext(
             user_id="default_user",
             session_id="web_session"
         )
         
+        logger.debug(f"[{request_id}] RequestContext created")
+        
         # ========== CALL VANNA AGENT ==========
-        # send_message() is async generator yielding UI Components
-        logger.info(f"[*] Querying agent...")
+        logger.info(f"[{request_id}] Querying Vanna agent...")
         
         sql_query = None
         components_received = []
@@ -164,32 +212,26 @@ async def chat(request: ChatRequest):
             conversation_id=None
         ):
             components_received.append(component)
-            logger.info(f"[COMPONENT] {len(components_received)}: {type(component).__name__}")
+            logger.debug(f"[{request_id}] Component received: {type(component).__name__}")
             
             # Get the actual data from the Pydantic model
             if hasattr(component, 'model_dump'):
                 data = component.model_dump()
                 
-                # Look for SQL in nested structures (especially text content)
+                # Look for SQL in nested structures
                 def extract_sql(obj):
                     if isinstance(obj, dict):
                         for key, val in obj.items():
-                            # Check if this field contains SQL
                             if isinstance(val, str) and "SELECT" in val.upper():
-                                # Extract SQL from markdown code blocks or plain text
                                 import re
-                                # First try to extract from ```sql ... ``` blocks
                                 sql_match = re.search(r'```sql\s*(SELECT.*?);?\s*```', val, re.DOTALL | re.IGNORECASE)
                                 if sql_match:
                                     return sql_match.group(1).strip()
-                                # Otherwise try to find SELECT statement
                                 sql_match = re.search(r'(SELECT\s+.*?);', val, re.DOTALL | re.IGNORECASE)
                                 if sql_match:
                                     return sql_match.group(1).strip() + ";"
-                                # Fallback: return whole value if it contains SELECT
                                 if "SELECT" in val.upper():
                                     return val
-                            # Recursively check nested structures
                             result = extract_sql(val)
                             if result:
                                 return result
@@ -200,25 +242,23 @@ async def chat(request: ChatRequest):
                                 return result
                     return None
                 
-                # Try to extract SQL from the component data
                 extracted = extract_sql(data)
                 if extracted:
                     sql_query = extracted
-                    logger.info(f"[+] Found SQL: {sql_query[:100]}")
+                    logger.info(f"[{request_id}] SQL Generated: {sql_query[:80]}...")
                     break
             elif hasattr(component, 'dict'):
-                # Fallback for older Pydantic versions
                 data = component.dict()
                 extracted = extract_sql(data)
                 if extracted:
                     sql_query = extracted
-                    logger.info(f"[+] Found SQL: {sql_query[:100]}")
+                    logger.info(f"[{request_id}] SQL Generated: {sql_query[:80]}...")
                     break
         
         # ========== CHECK IF SQL WAS GENERATED =========="
         if not sql_query:
-            logger.warning("[-] Agent did not generate valid SQL")
-            return JSONResponse({
+            logger.warning(f"[{request_id}] Agent did not generate valid SQL")
+            response = {
                 "message": "Could not generate SQL from question",
                 "sql_query": None,
                 "columns": None,
@@ -227,13 +267,15 @@ async def chat(request: ChatRequest):
                 "chart": None,
                 "chart_type": None,
                 "error": "No valid SQL generated by agent"
-            })
+            }
+            query_cache.set(question, response)
+            return JSONResponse(response)
         
         # ========== VALIDATE SQL ==========
         is_valid, error_msg = SQLValidator.validate(sql_query)
         if not is_valid:
-            logger.warning(f"[-] SQL validation failed: {error_msg}")
-            return JSONResponse({
+            logger.warning(f"[{request_id}] SQL validation failed: {error_msg}")
+            response = {
                 "message": "Generated SQL failed validation",
                 "sql_query": sql_query,
                 "columns": None,
@@ -242,11 +284,13 @@ async def chat(request: ChatRequest):
                 "chart": None,
                 "chart_type": None,
                 "error": error_msg
-            })
+            }
+            return JSONResponse(response)
         
         # ========== EXECUTE SQL =========="
         import sqlite3
         
+        logger.info(f"[{request_id}] Executing SQL query...")
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -274,11 +318,12 @@ async def chat(request: ChatRequest):
                 return value
             
             rows = [[convert_numpy_types(cell) for cell in row] for row in rows]
+            logger.info(f"[{request_id}] SQL executed successfully: {len(rows)} rows returned")
             
         except sqlite3.Error as e:
             conn.close()
-            logger.error(f"[-] SQL execution failed: {str(e)}")
-            return JSONResponse({
+            logger.error(f"[{request_id}] SQL execution failed: {str(e)}")
+            response = {
                 "message": "SQL execution failed",
                 "sql_query": sql_query,
                 "columns": None,
@@ -287,14 +332,14 @@ async def chat(request: ChatRequest):
                 "chart": None,
                 "chart_type": None,
                 "error": str(e)
-            })
+            }
+            return JSONResponse(response)
         
         conn.close()
         
-        logger.info(f"[+] Query successful: {len(rows)} rows")
-        
         if not rows:
-            return JSONResponse({
+            logger.info(f"[{request_id}] Query returned no results")
+            response = {
                 "message": "Query returned no results",
                 "sql_query": sql_query,
                 "columns": columns or [],
@@ -303,10 +348,13 @@ async def chat(request: ChatRequest):
                 "chart": None,
                 "chart_type": None,
                 "error": None
-            })
+            }
+            query_cache.set(question, response)
+            return JSONResponse(response)
         
         # ========== FORMAT RESPONSE =========="
-        summary = extract_summary(rows, columns)
+        logger.info(f"[{request_id}] Formatting response...")
+        summary = extract_summary(rows, columns, sql_query)
         
         # Final conversion to ensure no numpy types
         def make_json_compatible(obj):
@@ -328,7 +376,6 @@ async def chat(request: ChatRequest):
                 pass
             return obj
         
-        # Convert all data to JSON-compatible types
         rows = make_json_compatible(rows)
         columns = make_json_compatible(columns)
         
@@ -340,19 +387,22 @@ async def chat(request: ChatRequest):
             question=question
         )
         
-        # Convert response data to JSON-compatible format
         response_data = make_json_compatible(response_data)
         
+        logger.info(f"[{request_id}] Response prepared, caching result...")
+        query_cache.set(question, response_data)
+        
+        logger.info(f"[{request_id}] ✓ Request completed successfully")
         return JSONResponse(response_data)
         
     except asyncio.TimeoutError:
-        logger.error("[-] Agent request timed out")
+        logger.error(f"[{request_id}] Request timed out")
         return ChatResponse(
             message="Request timed out",
             error="Agent did not respond within time limit"
         )
     except Exception as e:
-        logger.error(f"[-] Unexpected error: {str(e)}")
+        logger.error(f"[{request_id}] Unexpected error: {str(e)}", exc_info=True)
         import traceback
         traceback.print_exc()
         return ChatResponse(

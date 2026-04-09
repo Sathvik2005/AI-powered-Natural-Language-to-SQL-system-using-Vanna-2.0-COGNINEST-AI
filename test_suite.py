@@ -38,7 +38,7 @@ TEST_QUESTIONS = [
     ("List patients with overdue invoices", "JOIN + filter", "join_filter"),
 ]
 
-API_URL = "http://localhost:8001"
+API_URL = "http://localhost:8000"
 TIMEOUT = 30
 
 def test_question(num, question, expected, category):
